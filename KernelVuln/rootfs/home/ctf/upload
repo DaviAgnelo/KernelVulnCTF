@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+
+BB=/bin/busybox
+MAX_ENCODED_BYTES=16777216
+
+if ! "$BB" test "$#" -ge 1 || ! "$BB" test "$#" -le 2; then
+    echo "Uso: upload NOME_DO_ARQUIVO [SHA256_ESPERADO]" >&2
+    exit 2
+fi
+
+case "$1" in
+    ''|.*|*[!A-Za-z0-9._-]*)
+        echo "Nome inválido; use somente letras, números, ponto, sublinhado e hífen." >&2
+        exit 2
+        ;;
+esac
+if ! "$BB" test "${#1}" -le 128; then
+    echo "Nome inválido; o limite é 128 caracteres." >&2
+    exit 2
+fi
+
+output="/home/ctf/$1"
+if "$BB" test -d "$output"; then
+    echo "Destino inválido: já existe um diretório com esse nome." >&2
+    exit 2
+fi
+expected_hash=${2-}
+if "$BB" test -n "$expected_hash"; then
+    if ! "$BB" test "${#expected_hash}" -eq 64; then
+        echo "SHA-256 inválido: informe exatamente 64 dígitos hexadecimais minúsculos." >&2
+        exit 2
+    fi
+    case "$expected_hash" in
+        *[!0-9a-f]*)
+            echo "SHA-256 inválido: use apenas 0-9 e a-f minúsculos." >&2
+            exit 2
+            ;;
+    esac
+fi
+
+umask 077
+encoded=$("$BB" mktemp /tmp/ctf-upload.XXXXXXXX) || {
+    echo "Não foi possível criar o arquivo temporário do upload." >&2
+    exit 1
+}
+decoded=$("$BB" mktemp /home/ctf/.ctf-upload.XXXXXXXX) || {
+    "$BB" rm -f "$encoded"
+    echo "Não foi possível criar o arquivo temporário de destino." >&2
+    exit 1
+}
+cleanup()
+{
+    "$BB" rm -f "$encoded"
+    if "$BB" test -n "$decoded"; then
+        "$BB" rm -f "$decoded"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "Cole o Base64 com linhas curtas (por exemplo, saída de: base64 ARQUIVO)."
+echo "Finalize com uma linha contendo apenas um ponto: ."
+terminated=0
+encoded_size=0
+while IFS= read -r line; do
+    if "$BB" test "$line" = .; then
+        terminated=1
+        break
+    fi
+    case "$line" in
+        *[!A-Za-z0-9+/=]*)
+            echo "Base64 inválido: caractere não permitido." >&2
+            exit 1
+            ;;
+    esac
+    encoded_size=$((encoded_size + ${#line} + 1))
+    if "$BB" test "$encoded_size" -gt "$MAX_ENCODED_BYTES"; then
+        echo "Upload excede o limite de $MAX_ENCODED_BYTES bytes em Base64." >&2
+        exit 1
+    fi
+    printf '%s\n' "$line" >> "$encoded"
+done
+
+if ! "$BB" test "$terminated" -eq 1; then
+    echo "Upload cancelado: terminador '.' não recebido." >&2
+    exit 1
+fi
+
+if ! "$BB" base64 -d "$encoded" > "$decoded" || ! "$BB" test -s "$decoded"; then
+    echo "Base64 inválido; nenhum arquivo foi mantido." >&2
+    exit 1
+fi
+
+"$BB" chmod 0700 "$decoded"
+hash_line=$("$BB" sha256sum "$decoded")
+actual_hash=${hash_line%% *}
+if "$BB" test -n "$expected_hash" && ! "$BB" test "$actual_hash" = "$expected_hash"; then
+    echo "SHA-256 divergente; arquivo removido." >&2
+    echo "Esperado: $expected_hash" >&2
+    echo "Obtido:   $actual_hash" >&2
+    exit 1
+fi
+
+"$BB" mv -f "$decoded" "$output"
+decoded=''
+trap - EXIT HUP INT TERM
+cleanup
+output_size=$("$BB" wc -c < "$output")
+echo "Arquivo salvo em $output (modo 0700, $output_size bytes)."
+echo "SHA256: $actual_hash"

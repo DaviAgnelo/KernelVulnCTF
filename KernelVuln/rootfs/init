@@ -1,0 +1,197 @@
+#!/bin/sh
+set -eu
+set -f
+
+# PID 1 do initramfs. Não existe fallback para shell root neste arquivo.
+BB=/bin/busybox
+
+fail_closed()
+{
+    printf '\n[FATAL] %s\n' "$1" >&2
+    printf '[FATAL] A VM será encerrada; nenhum shell administrativo será aberto.\n' >&2
+    # Não redirecionar para /dev/null: esta rotina também cobre falhas antes
+    # de devtmpfs ser montado, quando esse dispositivo pode ainda não existir.
+    "$BB" poweroff -f || true
+    while :; do
+        "$BB" sleep 3600
+    done
+}
+
+"$BB" mount -t proc proc /proc || fail_closed "não foi possível montar /proc"
+"$BB" mount -t sysfs sysfs /sys || fail_closed "não foi possível montar /sys"
+"$BB" mount -t devtmpfs devtmpfs /dev || fail_closed "não foi possível montar /dev"
+"$BB" mkdir -p /dev/pts /tmp /run || fail_closed "não foi possível criar diretórios de runtime"
+"$BB" mount -t devpts devpts /dev/pts || fail_closed "não foi possível montar /dev/pts"
+"$BB" mount -t tmpfs -o mode=1777,nosuid,nodev,size=32m tmpfs /tmp || \
+    fail_closed "não foi possível montar /tmp descartável"
+
+# Reaplica propriedade e modos em tempo de boot, sem depender do UID do builder.
+"$BB" chown 0:0 /root /root/flag.txt || fail_closed "chown da flag falhou"
+"$BB" chmod 0700 /root || fail_closed "chmod de /root falhou"
+"$BB" chmod 0400 /root/flag.txt || fail_closed "chmod da flag falhou"
+"$BB" chown -R 1000:1000 /home/ctf || fail_closed "chown do HOME ctf falhou"
+"$BB" chmod 0700 /home/ctf || fail_closed "chmod do HOME ctf falhou"
+
+CMDLINE=$("$BB" cat /proc/cmdline) || fail_closed "não foi possível ler /proc/cmdline"
+LEVEL=invalid
+LEVEL_ARGUMENTS=0
+SELF_TEST=0
+for argument in $CMDLINE; do
+    case "$argument" in
+        lab.level=*)
+            LEVEL=${argument#lab.level=}
+            LEVEL_ARGUMENTS=$((LEVEL_ARGUMENTS + 1))
+            ;;
+        lab.selftest=1) SELF_TEST=1 ;;
+    esac
+done
+"$BB" test "$LEVEL_ARGUMENTS" -eq 1 || \
+    fail_closed "a linha de comando deve conter exatamente um lab.level"
+
+cmdline_has_token()
+{
+    case " $CMDLINE " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_cmdline_token()
+{
+    if ! cmdline_has_token "$1"; then
+        fail_closed "o nível $LEVEL exige o parâmetro de kernel '$1'"
+    fi
+}
+
+forbid_cmdline_token()
+{
+    if cmdline_has_token "$1"; then
+        fail_closed "o parâmetro de kernel '$1' contradiz o nível $LEVEL"
+    fi
+}
+
+cpu_has_flag()
+{
+    "$BB" grep -Eq "(^|[[:space:]])$1([[:space:]]|$)" /proc/cpuinfo
+}
+
+require_cpu_flag()
+{
+    if ! cpu_has_flag "$1"; then
+        fail_closed "a CPU virtual do nível $LEVEL não oferece a flag '$1'"
+    fi
+}
+
+forbid_cpu_flag()
+{
+    if cpu_has_flag "$1"; then
+        fail_closed "a CPU virtual do nível $LEVEL oferece indevidamente a flag '$1'"
+    fi
+}
+
+# KASLR é habilitado por padrão quando CONFIG_RANDOMIZE_BASE=y; somente
+# 'nokaslr' é necessário para os níveis que o desabilitam. Os recursos SMEP e
+# SMAP são selecionados no modelo de CPU do QEMU e confirmados via /proc/cpuinfo.
+case "$LEVEL" in
+    0)
+        require_cmdline_token nokaslr
+        require_cmdline_token pti=off
+        forbid_cmdline_token pti=on
+        forbid_cpu_flag smep
+        forbid_cpu_flag smap
+        EXPECTED_KPTR=0
+        EXPECTED_DMESG=0
+        EXPECTED_PERF=1
+        ;;
+    1)
+        require_cmdline_token nokaslr
+        require_cmdline_token pti=off
+        forbid_cmdline_token pti=on
+        require_cpu_flag smep
+        forbid_cpu_flag smap
+        EXPECTED_KPTR=0
+        EXPECTED_DMESG=0
+        EXPECTED_PERF=1
+        ;;
+    2)
+        forbid_cmdline_token nokaslr
+        require_cmdline_token pti=off
+        forbid_cmdline_token pti=on
+        require_cpu_flag smep
+        forbid_cpu_flag smap
+        EXPECTED_KPTR=1
+        EXPECTED_DMESG=1
+        EXPECTED_PERF=3
+        ;;
+    3)
+        forbid_cmdline_token nokaslr
+        require_cmdline_token pti=off
+        forbid_cmdline_token pti=on
+        require_cpu_flag smep
+        require_cpu_flag smap
+        EXPECTED_KPTR=1
+        EXPECTED_DMESG=1
+        EXPECTED_PERF=3
+        ;;
+    4)
+        forbid_cmdline_token nokaslr
+        require_cmdline_token pti=on
+        forbid_cmdline_token pti=off
+        require_cpu_flag smep
+        require_cpu_flag smap
+        EXPECTED_KPTR=1
+        EXPECTED_DMESG=1
+        EXPECTED_PERF=3
+        ;;
+    *) fail_closed "nível ausente ou inválido na linha de comando do kernel" ;;
+esac
+
+printf '%s\n' "$EXPECTED_KPTR" > /proc/sys/kernel/kptr_restrict || \
+    fail_closed "não foi possível configurar kptr_restrict"
+printf '%s\n' "$EXPECTED_DMESG" > /proc/sys/kernel/dmesg_restrict || \
+    fail_closed "não foi possível configurar dmesg_restrict"
+printf '%s\n' "$EXPECTED_PERF" > /proc/sys/kernel/perf_event_paranoid || \
+    fail_closed "não foi possível configurar perf_event_paranoid"
+
+ACTUAL_KPTR=$("$BB" cat /proc/sys/kernel/kptr_restrict) || \
+    fail_closed "não foi possível reler kptr_restrict"
+ACTUAL_DMESG=$("$BB" cat /proc/sys/kernel/dmesg_restrict) || \
+    fail_closed "não foi possível reler dmesg_restrict"
+ACTUAL_PERF=$("$BB" cat /proc/sys/kernel/perf_event_paranoid) || \
+    fail_closed "não foi possível reler perf_event_paranoid"
+"$BB" test "$ACTUAL_KPTR" = "$EXPECTED_KPTR" || \
+    fail_closed "kptr_restrict divergiu do nível $LEVEL"
+"$BB" test "$ACTUAL_DMESG" = "$EXPECTED_DMESG" || \
+    fail_closed "dmesg_restrict divergiu do nível $LEVEL"
+"$BB" test "$ACTUAL_PERF" = "$EXPECTED_PERF" || \
+    fail_closed "perf_event_paranoid divergiu do nível $LEVEL"
+
+if "$BB" test "$SELF_TEST" = 1; then
+    printf 'SELFTEST: LEVEL_POLICY_%s=PASS\n' "$LEVEL"
+fi
+
+printf '[*] Carregando o módulo vulnerável...\n'
+"$BB" insmod /lib/modules/kvuln.ko || fail_closed "insmod de kvuln.ko falhou"
+"$BB" test -c /dev/kvuln || fail_closed "/dev/kvuln não foi criado"
+"$BB" chown 0:1000 /dev/kvuln || fail_closed "chown de /dev/kvuln falhou"
+"$BB" chmod 0660 /dev/kvuln || fail_closed "chmod de /dev/kvuln falhou"
+
+printf '\n==================================================\n'
+printf '  Kernel CTF Lab :: %s\n' "$("$BB" cat /etc/challenge-name)"
+printf '  Nível: %s | usuário esperado: ctf (UID/GID 1000)\n' "$LEVEL"
+printf '  Dispositivo: /dev/kvuln\n'
+printf '  Flag: /root/flag.txt (root:root 0400)\n'
+printf '  Rede, discos, 9p e monitor QEMU: desabilitados\n'
+printf '==================================================\n\n'
+
+if "$BB" test "$SELF_TEST" = 1; then
+    /sbin/ctf-login --self-test || fail_closed "autoteste de identidade falhou"
+else
+    /sbin/ctf-login || fail_closed "sessão ctf terminou com erro"
+fi
+
+printf '\n[*] Sessão encerrada. Desligando a VM descartável.\n'
+"$BB" poweroff -f || fail_closed "poweroff falhou"
+while :; do
+    "$BB" sleep 3600
+done

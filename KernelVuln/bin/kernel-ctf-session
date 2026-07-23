@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 0077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+LAB_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+# shellcheck source=scripts/lib.sh
+source "$LAB_ROOT/scripts/lib.sh"
+
+assert_project_root "$LAB_ROOT"
+
+SELF_TEST=0
+case "$#" in
+    0) ;;
+    1)
+        [[ $1 == --self-test ]] || die "opção desconhecida: $1"
+        SELF_TEST=1
+        ;;
+    *) die "uso: kernel-ctf-session [--self-test]" ;;
+esac
+
+require_non_root
+bash "$LAB_ROOT/scripts/check-deps.sh" runtime
+
+DIST_DIR=$LAB_ROOT/dist
+RUNTIME_CONFIG=$DIST_DIR/runtime.conf
+MANIFEST=$DIST_DIR/SHA256SUMS
+[[ -r $RUNTIME_CONFIG ]] || die "runtime.conf ausente; execute ./build.sh all e reinstale o laboratório"
+[[ -r $MANIFEST ]] || die "SHA256SUMS ausente; execute ./build.sh all e reinstale o laboratório"
+
+log_info "validando integridade dos artefatos antes do boot"
+(
+    cd "$DIST_DIR"
+    sha256sum --check --strict SHA256SUMS
+) || die "um artefato do laboratório foi alterado ou corrompido"
+
+load_lab_config "$RUNTIME_CONFIG"
+validate_lab_values
+
+LEVEL=$(config_get DEFAULT_LEVEL)
+MEMORY_MIB=$(config_get MEMORY_MIB)
+VCPUS=$(config_get VCPUS)
+MAX_SESSIONS=$(config_get MAX_SESSIONS)
+SESSION_TIMEOUT_SECONDS=$(config_get SESSION_TIMEOUT_SECONDS)
+HOST_VMEM_KIB=$(config_get HOST_VMEM_KIB)
+ACCELERATION=$(config_get ACCELERATION)
+CHALLENGE_NAME=$(config_get CHALLENGE_NAME)
+
+set_level_profile "$LEVEL"
+CPU_MODEL=$LEVEL_CPU_MODEL
+MITIGATION_ARGS=$LEVEL_KERNEL_ARGS
+
+case "$ACCELERATION" in
+    auto)
+        if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+            ACCELERATOR=kvm
+        else
+            ACCELERATOR=tcg,thread=multi
+            log_warn "/dev/kvm indisponível; usando TCG (mais lento)"
+        fi
+        ;;
+    kvm)
+        [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || \
+            die "ACCELERATION=kvm, mas /dev/kvm não é acessível pelo usuário $(id -un)"
+        ACCELERATOR=kvm
+        ;;
+    tcg) ACCELERATOR=tcg,thread=multi ;;
+esac
+
+RUNTIME_DIR=${KERNEL_CTF_RUNTIME_DIR:-/run/kernel-ctf}
+[[ -d $RUNTIME_DIR && ! -L $RUNTIME_DIR ]] || \
+    die "diretório de runtime seguro ausente: $RUNTIME_DIR"
+runtime_real=$(readlink -f -- "$RUNTIME_DIR")
+runtime_owner=$(stat -c '%u' -- "$runtime_real")
+runtime_mode=$(stat -c '%a' -- "$runtime_real")
+[[ $runtime_owner == "$(id -u)" ]] || die "$runtime_real deve pertencer ao usuário da sessão"
+[[ $runtime_mode == 700 ]] || die "$runtime_real deve ter modo 0700 (modo atual: $runtime_mode)"
+
+slot=0
+slot_fd=''
+for ((candidate = 1; candidate <= MAX_SESSIONS; candidate += 1)); do
+    exec {candidate_fd}>"$runtime_real/slot.$candidate.lock"
+    if flock -n "$candidate_fd"; then
+        slot=$candidate
+        slot_fd=$candidate_fd
+        break
+    fi
+    exec {candidate_fd}>&-
+done
+[[ $slot -ne 0 ]] || die "limite de $MAX_SESSIONS sessões simultâneas atingido"
+
+SESSION_DIR=$(mktemp -d "$runtime_real/session.XXXXXXXX")
+[[ $SESSION_DIR == "$runtime_real"/session.* ]] || die "mktemp retornou caminho inesperado"
+QEMU_PID=''
+
+cleanup()
+{
+    local attempt
+    trap - EXIT HUP INT TERM
+    if [[ -n $QEMU_PID ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
+        kill -TERM -- "-$QEMU_PID" 2>/dev/null || kill -TERM "$QEMU_PID" 2>/dev/null || true
+        for attempt in {1..20}; do
+            kill -0 "$QEMU_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$QEMU_PID" 2>/dev/null; then
+            kill -KILL -- "-$QEMU_PID" 2>/dev/null || kill -KILL "$QEMU_PID" 2>/dev/null || true
+        fi
+        wait "$QEMU_PID" 2>/dev/null || true
+    fi
+    if [[ -n ${SESSION_DIR:-} && $SESSION_DIR == "$runtime_real"/session.* ]]; then
+        rm -rf -- "$SESSION_DIR"
+    fi
+    if [[ -n $slot_fd ]]; then
+        exec {slot_fd}>&-
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ulimit -c 0
+ulimit -n 128
+ulimit -v "$HOST_VMEM_KIB"
+
+export HOME=/nonexistent
+export USER=kernelctf
+export LOGNAME=kernelctf
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=C
+export LC_ALL=C
+export TMPDIR=$SESSION_DIR
+unset CDPATH ENV BASH_ENV GCONV_PATH LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD PYTHONPATH
+
+KERNEL_CMDLINE="rdinit=/init console=ttyS0,115200n8 quiet loglevel=3 oops=panic panic=1 random.trust_cpu=on lab.level=$LEVEL $MITIGATION_ARGS"
+if ((SELF_TEST == 1)); then
+    KERNEL_CMDLINE+=" lab.selftest=1"
+    log_info "modo de autoteste: o guest validará a política e encerrará sem shell interativo"
+fi
+
+printf '\n[*] Iniciando %s (nível %s, slot %s/%s, accel=%s)\n' \
+    "$CHALLENGE_NAME" "$LEVEL" "$slot" "$MAX_SESSIONS" "$ACCELERATOR"
+printf '[*] A VM é nova, sem rede e será destruída ao sair.\n\n'
+
+setsid timeout --foreground --signal=TERM --kill-after=5s \
+    "${SESSION_TIMEOUT_SECONDS}s" \
+    qemu-system-x86_64 \
+        -name "kernel-ctf-$slot,process=kernel-ctf" \
+        -machine pc \
+        -accel "$ACCELERATOR" \
+        -cpu "$CPU_MODEL" \
+        -m "${MEMORY_MIB}M" \
+        -smp "$VCPUS" \
+        -kernel "$DIST_DIR/bzImage" \
+        -initrd "$DIST_DIR/initramfs.cpio.gz" \
+        -append "$KERNEL_CMDLINE" \
+        -nodefaults \
+        -no-user-config \
+        -display none \
+        -chardev stdio,id=serial0,signal=off \
+        -serial chardev:serial0 \
+        -monitor none \
+        -nic none \
+        -no-reboot \
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+        <&0 &
+QEMU_PID=$!
+
+set +e
+wait "$QEMU_PID"
+qemu_status=$?
+set -e
+QEMU_PID=''
+
+case "$qemu_status" in
+    0)
+        cleanup
+        if ((SELF_TEST == 1)); then
+            log_ok "autoteste do launcher encerrado; estado descartado"
+        else
+            log_ok "sessão encerrada; estado descartado"
+        fi
+        ;;
+    124) die "tempo máximo de sessão (${SESSION_TIMEOUT_SECONDS}s) atingido; VM encerrada" ;;
+    *) die "QEMU terminou com status $qemu_status; veja as mensagens acima" ;;
+esac

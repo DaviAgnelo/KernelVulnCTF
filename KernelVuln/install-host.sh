@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 0022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=scripts/lib.sh
@@ -14,6 +15,10 @@ SSH_TEST_CLIENT_HOST=localhost
 SSH_TEST_CLIENT_ADDRESS=127.0.0.1
 SSH_TEST_LOCAL_ADDRESS=127.0.0.1
 SSH_TEST_LOCAL_PORT=22
+SSHD_MAIN=/etc/ssh/sshd_config
+SSHD_SERVICE=''
+SSHD_SOCKET=''
+SSHD_RELOAD_MODE='disabled'
 
 usage()
 {
@@ -28,7 +33,7 @@ Uso: sudo bash ./install-host.sh [opções]
                               Endereço de origem para validar regras Match.
   --ssh-test-local-address IP Endereço local do endpoint SSH dos alunos.
   --ssh-test-local-port PORTA Porta local do endpoint SSH dos alunos.
-  --no-reload-ssh             Valida, mas não recarrega ssh.service.
+  --no-reload-ssh             Valida, mas não recarrega a unidade OpenSSH.
 
 Na primeira instalação, --authorized-keys é obrigatório. Em atualizações, o
 arquivo /etc/ssh/authorized_keys/NOME existente é preservado se a opção faltar.
@@ -85,7 +90,7 @@ while (($# > 0)); do
 done
 
 require_root
-require_debian_bookworm
+require_systemd_host
 assert_project_root "$PROJECT_ROOT"
 bash "$PROJECT_ROOT/scripts/check-deps.sh" host-install
 
@@ -98,6 +103,152 @@ for ssh_context_value in "$SSH_TEST_CLIENT_HOST" "$SSH_TEST_CLIENT_ADDRESS" \
         die "contexto SSH inválido: $ssh_context_value"
 done
 require_uint_range SSH_TEST_LOCAL_PORT "$SSH_TEST_LOCAL_PORT" 1 65535
+
+validate_root_managed_executable()
+{
+    local candidate=$1 resolved current owner mode
+
+    resolved=$(readlink -f -- "$candidate") || \
+        die "não foi possível resolver o executável: $candidate"
+    [[ $resolved == /* && -f $resolved && -x $resolved ]] || \
+        die "executável inválido: $candidate"
+
+    current=$resolved
+    while [[ $current != / ]]; do
+        owner=$(stat -c '%u' -- "$current") || \
+            die "não foi possível inspecionar $current"
+        mode=$(stat -c '%a' -- "$current") || \
+            die "não foi possível inspecionar o modo de $current"
+        [[ $owner == 0 ]] || \
+            die "componente executável não pertence a root: $current"
+        (( (8#$mode & 0022) == 0 )) || \
+            die "componente executável permite escrita por grupo/outros: $current (modo $mode)"
+        current=$(dirname -- "$current")
+    done
+    printf '%s\n' "$resolved"
+}
+
+unit_is_loaded()
+{
+    [[ $(systemctl show --property=LoadState --value "$1" 2>/dev/null || true) == loaded ]]
+}
+
+resolve_sshd_unit()
+{
+    local service socket
+
+    for service in ssh.service sshd.service; do
+        if unit_is_loaded "$service" && systemctl is-active --quiet "$service"; then
+            SSHD_SERVICE=$service
+            SSHD_RELOAD_MODE=service
+            return 0
+        fi
+    done
+
+    for socket in ssh.socket sshd.socket; do
+        if unit_is_loaded "$socket" && systemctl is-active --quiet "$socket"; then
+            SSHD_SOCKET=$socket
+            case "$socket" in
+                ssh.socket) SSHD_SERVICE=ssh.service ;;
+                sshd.socket) SSHD_SERVICE=sshd.service ;;
+            esac
+            SSHD_RELOAD_MODE=socket
+            return 0
+        fi
+    done
+
+    if [[ $RELOAD_SSH -eq 0 ]]; then
+        for service in ssh.service sshd.service; do
+            if unit_is_loaded "$service"; then
+                SSHD_SERVICE=$service
+                break
+            fi
+        done
+        return 0
+    fi
+    die "nenhuma unidade OpenSSH ativa foi encontrada (ssh.service, sshd.service, ssh.socket ou sshd.socket); inicie o serviço ou use --no-reload-ssh"
+}
+
+validate_running_sshd_config()
+{
+    local main_pid argument previous='' configured_path=''
+    local -a process_arguments=()
+
+    [[ $SSHD_RELOAD_MODE == service ]] || return 0
+    main_pid=$(systemctl show --property=MainPID --value "$SSHD_SERVICE") || \
+        die "não foi possível obter o PID principal de $SSHD_SERVICE"
+    [[ $main_pid =~ ^[1-9][0-9]*$ && -r /proc/$main_pid/cmdline ]] || \
+        die "PID principal inválido para $SSHD_SERVICE: $main_pid"
+
+    while IFS= read -r -d '' argument; do
+        process_arguments+=("$argument")
+    done < "/proc/$main_pid/cmdline"
+    for argument in "${process_arguments[@]}"; do
+        if [[ $previous == -f ]]; then
+            configured_path=$argument
+            break
+        fi
+        case "$argument" in
+            -f?*) configured_path=${argument#-f}; break ;;
+        esac
+        previous=$argument
+    done
+    if [[ -n $configured_path ]]; then
+        configured_path=$(readlink -f -- "$configured_path") || \
+            die "o serviço OpenSSH usa uma configuração -f inválida: $configured_path"
+        [[ $configured_path == "$(readlink -f -- "$SSHD_MAIN")" ]] || \
+            die "$SSHD_SERVICE usa $configured_path, mas este instalador gerencia $SSHD_MAIN"
+    fi
+}
+
+reload_sshd_unit()
+{
+    if [[ -n $SSHD_SERVICE ]] && systemctl is-active --quiet "$SSHD_SERVICE"; then
+        systemctl reload "$SSHD_SERVICE"
+        return
+    fi
+    if [[ $SSHD_RELOAD_MODE == socket && -n $SSHD_SOCKET ]] && \
+       systemctl is-active --quiet "$SSHD_SOCKET"; then
+        log_info "$SSHD_SOCKET está ativo e o serviço está inativo; a configuração será usada na próxima ativação"
+        return 0
+    fi
+    return 1
+}
+
+restore_security_context()
+{
+    command -v restorecon >/dev/null 2>&1 || return 0
+    restorecon -F -- "$@"
+}
+
+QEMU_X86_64_BIN=$(resolve_qemu_x86_64) || \
+    die "QEMU x86_64 não foi encontrado após a validação de dependências"
+QEMU_X86_64_BIN=$(validate_root_managed_executable "$QEMU_X86_64_BIN")
+ENV_BIN=$(type -P env) || die "env não encontrado"
+ENV_BIN=$(validate_root_managed_executable "$ENV_BIN")
+validate_root_managed_executable /bin/sh >/dev/null
+
+install_mount_options=$(findmnt -n -o OPTIONS -T /opt) || \
+    die "não foi possível inspecionar as opções de montagem de /opt"
+if [[ ,$install_mount_options, == *,noexec,* ]]; then
+    die "/opt está montado com noexec; escolha um host em que o launcher possa ser executado"
+fi
+
+resolve_sshd_unit
+[[ -f $SSHD_MAIN && ! -L $SSHD_MAIN ]] || \
+    die "$SSHD_MAIN deve ser um arquivo regular, não um link simbólico"
+[[ $(stat -c '%u' -- "$SSHD_MAIN") == 0 ]] || die "$SSHD_MAIN deve pertencer a root"
+sshd_main_mode=$(stat -c '%a' -- "$SSHD_MAIN")
+(( (8#$sshd_main_mode & 0022) == 0 )) || \
+    die "$SSHD_MAIN permite escrita por grupo/outros"
+validate_running_sshd_config
+sshd -t -f "$SSHD_MAIN" || \
+    die "a configuração OpenSSH original é inválida; nenhum arquivo do laboratório foi alterado"
+
+if command -v getenforce >/dev/null 2>&1 && [[ $(getenforce) == Enforcing ]] && \
+   ! command -v restorecon >/dev/null 2>&1; then
+    die "SELinux está enforcing, mas restorecon não está disponível"
+fi
 
 validate_secure_install_path()
 {
@@ -277,6 +428,9 @@ install -o root -g "$HOST_USER" -m 0440 "$PROJECT_ROOT/scripts/lib.sh" \
 for artifact in bzImage kvuln.ko initramfs.cpio.gz runtime.conf SHA256SUMS; do
     install -o root -g "$HOST_USER" -m 0440 "$PROJECT_ROOT/dist/$artifact" "$INSTALL_ROOT/dist/$artifact"
 done
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon -RF -- "$INSTALL_ROOT"
+fi
 
 AUTHORIZED_KEYS_DIR=/etc/ssh/authorized_keys
 if [[ -e $AUTHORIZED_KEYS_DIR || -L $AUTHORIZED_KEYS_DIR ]]; then
@@ -304,6 +458,7 @@ fi
 keys_candidate=''
 keys_validation_file=''
 keys_published=0
+keys_backup=''
 key_probe=''
 cleanup_keys_candidate_on_exit()
 {
@@ -311,6 +466,7 @@ cleanup_keys_candidate_on_exit()
     trap - EXIT HUP INT TERM
     [[ -z ${keys_candidate:-} ]] || rm -f -- "$keys_candidate"
     [[ -z ${key_probe:-} ]] || rm -f -- "$key_probe"
+    [[ -z ${keys_backup:-} ]] || rm -f -- "$keys_backup"
     exit "$status"
 }
 trap cleanup_keys_candidate_on_exit EXIT
@@ -398,24 +554,17 @@ printf 'd /run/kernel-ctf 0700 %s %s -\n' "$HOST_USER" "$HOST_USER" > "$tmpfiles
 chown root:root "$tmpfiles_candidate"
 chmod 0644 "$tmpfiles_candidate"
 mv -f -- "$tmpfiles_candidate" "$TMPFILES_CONFIG"
+restore_security_context "$TMPFILES_CONFIG"
 systemd-tmpfiles --create "$TMPFILES_CONFIG"
 
-SSHD_MAIN=/etc/ssh/sshd_config
 MANAGED_BEGIN='# BEGIN KERNEL-CTF-LAB MANAGED BLOCK'
 MANAGED_END='# END KERNEL-CTF-LAB MANAGED BLOCK'
 LEGACY_SNIPPET=/etc/ssh/sshd_config.d/90-kernel-ctf.conf
 
-[[ -f $SSHD_MAIN && ! -L $SSHD_MAIN ]] || \
-    die "$SSHD_MAIN deve ser um arquivo regular, não um link simbólico"
-[[ $(stat -c '%u' -- "$SSHD_MAIN") == 0 ]] || die "$SSHD_MAIN deve pertencer a root"
-sshd_main_mode=$(stat -c '%a' -- "$SSHD_MAIN")
-(( (8#$sshd_main_mode & 0022) == 0 )) || \
-    die "$SSHD_MAIN permite escrita por grupo/outros"
-
 validate_effective_sshd_config()
 {
-    local candidate=$1 effective expected acceptenv_line
-    local expected_force="/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $INSTALL_ROOT/bin/kernel-ctf-session"
+    local candidate=$1 effective expected acceptenv_line acceptenv_token
+    local expected_force="$ENV_BIN -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $INSTALL_ROOT/bin/kernel-ctf-session"
     local -a required_effective=(
         "authorizedkeysfile /etc/ssh/authorized_keys/%u"
         "authorizedkeyscommand none"
@@ -454,13 +603,15 @@ validate_effective_sshd_config()
         }
     done
     while IFS= read -r acceptenv_line; do
-        case "$acceptenv_line" in
-            'acceptenv LANG'|'acceptenv LC_*') ;;
-            *)
+        for acceptenv_token in ${acceptenv_line#acceptenv }; do
+            case "$acceptenv_token" in
+                LANG|LC_*) ;;
+                *)
                 log_warn "sshd aceita variável de ambiente fora da lista segura: ${acceptenv_line#acceptenv }"
                 return 1
-                ;;
-        esac
+                    ;;
+            esac
+        done
     done < <(grep '^acceptenv ' <<<"$effective" || true)
     if grep -q '^setenv ' <<<"$effective"; then
         log_warn "sshd aplica SetEnv à conta restrita; remova essa diretiva do contexto"
@@ -468,14 +619,16 @@ validate_effective_sshd_config()
     fi
 }
 
-# Drop-ins são incluídos no início da configuração padrão do Debian 12. Um bloco
-# Match dentro deles contaminaria diretivas globais posteriores; por isso o bloco
-# gerenciado fica deliberadamente no fim do arquivo principal.
+# Em várias distribuições, os drop-ins são incluídos antes das diretivas globais.
+# Um bloco Match dentro deles pode contaminar o restante; por isso o bloco
+# gerenciado fica deliberadamente no fim do arquivo principal já validado.
 legacy_backup=''
 main_backup=''
 main_candidate=''
 legacy_removed=0
 main_replaced=0
+control_before=''
+control_after=''
 
 rollback_ssh_on_exit()
 {
@@ -485,9 +638,21 @@ rollback_ssh_on_exit()
 
     if ((status != 0)); then
         set +e
+        if ((keys_published == 1)); then
+            if [[ -n ${keys_backup:-} && -e $keys_backup ]]; then
+                mv -f -- "$keys_backup" "$AUTHORIZED_KEYS_DEST"
+                restore_security_context "$AUTHORIZED_KEYS_DEST" || true
+            else
+                rm -f -- "$AUTHORIZED_KEYS_DEST"
+            fi
+        elif [[ -n ${keys_backup:-} && -e $keys_backup ]]; then
+            rm -f -- "$keys_backup"
+        fi
         [[ -z ${keys_candidate:-} ]] || rm -f -- "$keys_candidate"
         [[ -z ${key_probe:-} ]] || rm -f -- "$key_probe"
         [[ -z $main_candidate ]] || rm -f -- "$main_candidate"
+        [[ -z $control_before ]] || rm -f -- "$control_before"
+        [[ -z $control_after ]] || rm -f -- "$control_after"
         if ((main_replaced == 1)) && [[ -n $main_backup && -e $main_backup ]]; then
             mv -f -- "$main_backup" "$SSHD_MAIN"
             restored_main=1
@@ -499,7 +664,7 @@ rollback_ssh_on_exit()
         fi
         if ((restored_main == 1)) && [[ $RELOAD_SSH -eq 1 ]] && \
            sshd -t -f "$SSHD_MAIN"; then
-            systemctl reload ssh.service || \
+            reload_sshd_unit || \
                 log_warn "configuração SSH anterior restaurada, mas o reload de recuperação falhou"
         fi
     fi
@@ -510,6 +675,11 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+control_before=$(mktemp /etc/ssh/.kernel-ctf-control-before.XXXXXXXX)
+sshd -T -f "$SSHD_MAIN" \
+    -C "user=root,host=$SSH_TEST_CLIENT_HOST,addr=$SSH_TEST_CLIENT_ADDRESS,laddr=$SSH_TEST_LOCAL_ADDRESS,lport=$SSH_TEST_LOCAL_PORT" \
+    > "$control_before" || die "não foi possível registrar a política SSH do usuário de controle"
+
 if [[ -e $LEGACY_SNIPPET || -L $LEGACY_SNIPPET ]]; then
     [[ -f $LEGACY_SNIPPET && ! -L $LEGACY_SNIPPET ]] || \
         die "$LEGACY_SNIPPET existente é inseguro"
@@ -519,13 +689,13 @@ if [[ -e $LEGACY_SNIPPET || -L $LEGACY_SNIPPET ]]; then
         die "$LEGACY_SNIPPET já existe e não pertence a este projeto"
     fi
     legacy_backup=$(mktemp /etc/ssh/sshd_config.d/90-kernel-ctf.backup.XXXXXXXX)
-    cp --preserve=mode,ownership,timestamps -- "$LEGACY_SNIPPET" "$legacy_backup"
+    cp --preserve=all -- "$LEGACY_SNIPPET" "$legacy_backup"
     rm -f -- "$LEGACY_SNIPPET"
     legacy_removed=1
 fi
 
-install -d -o root -g root -m 0755 /run/sshd
 main_candidate=$(mktemp /etc/ssh/sshd_config.kernel-ctf.XXXXXXXX)
+cp --preserve=all -- "$SSHD_MAIN" "$main_candidate"
 if ! awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
     $0 == begin { if (inside) exit 42; inside = 1; found_begin = 1; next }
     $0 == end   { if (!inside) exit 43; inside = 0; found_end = 1; next }
@@ -556,6 +726,8 @@ Match User $HOST_USER
     GSSAPIAuthentication no
     KerberosAuthentication no
     PermitEmptyPasswords no
+    AcceptEnv LANG
+    AcceptEnv LC_*
     PermitTTY yes
     DisableForwarding yes
     AllowAgentForwarding no
@@ -568,10 +740,9 @@ Match User $HOST_USER
     PermitListen none
     GatewayPorts no
     MaxSessions 1
-    ForceCommand /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $INSTALL_ROOT/bin/kernel-ctf-session
+    ForceCommand $ENV_BIN -i PATH=/usr/sbin:/usr/bin:/sbin:/bin $INSTALL_ROOT/bin/kernel-ctf-session
 $MANAGED_END
 EOF
-chmod 0600 "$main_candidate"
 
 if ! sshd -t -f "$main_candidate"; then
     [[ -z $legacy_backup ]] || mv -f -- "$legacy_backup" "$LEGACY_SNIPPET"
@@ -583,14 +754,19 @@ if ! validate_effective_sshd_config "$main_candidate"; then
     rm -f -- "$main_candidate"
     die "outra regra Match prevalece sobre as restrições da conta $HOST_USER"
 fi
+control_after=$(mktemp /etc/ssh/.kernel-ctf-control-after.XXXXXXXX)
+sshd -T -f "$main_candidate" \
+    -C "user=root,host=$SSH_TEST_CLIENT_HOST,addr=$SSH_TEST_CLIENT_ADDRESS,laddr=$SSH_TEST_LOCAL_ADDRESS,lport=$SSH_TEST_LOCAL_PORT" \
+    > "$control_after" || die "não foi possível validar a política SSH do usuário de controle"
+cmp -s -- "$control_before" "$control_after" || \
+    die "a configuração candidata alteraria a política SSH efetiva do usuário de controle"
 
 main_backup=$(mktemp /etc/ssh/sshd_config.backup.XXXXXXXX)
-cp --preserve=mode,ownership,timestamps -- "$SSHD_MAIN" "$main_backup"
+cp --preserve=all -- "$SSHD_MAIN" "$main_backup"
 main_replaced=1
-chown root:root "$main_candidate"
-chmod 0600 "$main_candidate"
 mv -f -- "$main_candidate" "$SSHD_MAIN"
 main_candidate=''
+restore_security_context "$SSHD_MAIN"
 
 if ! sshd -t -f "$SSHD_MAIN"; then
     mv -f -- "$main_backup" "$SSHD_MAIN"
@@ -603,14 +779,14 @@ if ! validate_effective_sshd_config "$SSHD_MAIN"; then
     die "configuração SSH efetiva divergente; alteração revertida"
 fi
 if [[ $RELOAD_SSH -eq 1 ]]; then
-    if ! systemctl reload ssh.service; then
+    if ! reload_sshd_unit; then
         mv -f -- "$main_backup" "$SSHD_MAIN"
         [[ -z $legacy_backup ]] || mv -f -- "$legacy_backup" "$LEGACY_SNIPPET"
         if sshd -t -f "$SSHD_MAIN"; then
-            systemctl reload ssh.service || \
+            reload_sshd_unit || \
                 log_warn "a configuração anterior foi restaurada, mas o segundo reload também falhou"
         fi
-        die "reload de ssh.service falhou; configuração anterior restaurada"
+        die "reload da unidade OpenSSH falhou; configuração anterior restaurada"
     fi
 else
     log_warn "sshd não foi recarregado (--no-reload-ssh)"
@@ -619,9 +795,14 @@ fi
 log_info "política SSH validada no contexto: cliente=$SSH_TEST_CLIENT_ADDRESS ($SSH_TEST_CLIENT_HOST), endpoint=$SSH_TEST_LOCAL_ADDRESS:$SSH_TEST_LOCAL_PORT"
 trap '' HUP INT TERM
 if [[ -n $keys_candidate ]]; then
+    if [[ -e $AUTHORIZED_KEYS_DEST ]]; then
+        keys_backup=$(mktemp "$AUTHORIZED_KEYS_DIR/$HOST_USER.backup.XXXXXXXX")
+        cp --preserve=all -- "$AUTHORIZED_KEYS_DEST" "$keys_backup"
+    fi
     mv -f -- "$keys_candidate" "$AUTHORIZED_KEYS_DEST"
     keys_candidate=''
     keys_published=1
+    restore_security_context "$AUTHORIZED_KEYS_DEST"
 fi
 main_replaced=0
 legacy_removed=0
@@ -632,7 +813,14 @@ if ((keys_published == 1)); then
 fi
 rm -f -- "$main_backup"
 [[ -z $legacy_backup ]] || rm -f -- "$legacy_backup"
+[[ -z $keys_backup ]] || rm -f -- "$keys_backup"
+rm -f -- "$control_before" "$control_after"
 
 log_ok "laboratório instalado em $INSTALL_ROOT"
 log_ok "conta SSH: $HOST_USER (senha bloqueada, somente chave, ForceCommand ativo)"
+log_info "QEMU selecionado: $QEMU_X86_64_BIN; OpenSSH: ${SSHD_SERVICE:-sem unidade} (${SSHD_RELOAD_MODE})"
+if [[ -r /sys/module/apparmor/parameters/enabled ]] && \
+   grep -Fqx 'Y' /sys/module/apparmor/parameters/enabled; then
+    log_warn "AppArmor está ativo; confirme o login SSH e o launcher real antes da aula"
+fi
 log_info "teste a partir de outra sessão: ssh -tt $HOST_USER@ENDERECO_DO_LAB"

@@ -1,7 +1,8 @@
-# Kernel CTF Lab para Debian 12 + Proxmox
+# Kernel CTF Lab para Linux x86_64 + Proxmox
 
 Laboratório descartável de exploração de kernel Linux. O aluno conecta por SSH
-ao host Debian 12 e o `sshd` executa, obrigatoriamente, uma instância QEMU nova.
+ao host Linux x86_64 e o `sshd` executa, obrigatoriamente, uma instância QEMU
+nova.
 O console serial da VM vira a própria sessão SSH. Ao sair, desconectar ou atingir
 o tempo limite, o processo QEMU e seu grupo são encerrados e todo o estado some.
 
@@ -9,19 +10,22 @@ O projeto inclui um desafio inicial, `stack-gateway`, com um módulo
 deliberadamente vulnerável a leak/overflow de pilha e níveis de mitigação 0–4.
 Ele foi inspirado na organização curricular do
 [0xCD4/kernel-ctf-lab](https://github.com/0xCD4/kernel-ctf-lab), mas o boot, a
-troca de usuário e o launcher foram reescritos para falhar de forma fechada no
-Debian 12.
+troca de usuário e o launcher foram reescritos para falhar de forma fechada.
 
-> **Use somente em uma VM Debian 12 dedicada.** Um kernel guest hostil ainda
+> **Use somente em uma VM Linux x86_64 dedicada.** Um kernel guest hostil ainda
 > ataca a superfície do emulador QEMU. Não instale este laboratório em um host
 > que contenha dados ou credenciais importantes.
 
 ## Controles implementados e limites
 
-- Debian 12 Bookworm é detectado por `/etc/os-release`; o instalador recusa outro
-  sistema, sem caminhos ou pacotes específicos do Ubuntu.
-- `qemu-system-x86_64`, `cpio`, `gzip`, BusyBox estático, toolchain, headers e
-  utilitários de sessão são validados com mensagens e pacotes Debian sugeridos.
+- O sistema e a arquitetura são detectados por `uname` e `/etc/os-release`.
+  Build e runtime aceitam Linux x86_64 quando as capacidades necessárias estão
+  presentes; a instalação SSH exige também `systemd` ativo como PID 1 e OpenSSH.
+- Debian/Ubuntu, Fedora/RHEL-like, Arch-like e openSUSE/SLES têm perfis de dicas;
+  distribuições desconhecidas usam o perfil genérico. Nomes de pacotes são
+  apenas orientativos: `scripts/check-deps.sh` é a autoridade sobre capacidades.
+- `qemu-system-x86_64` ou `qemu-kvm`, GNU `cpio`, `gzip`, BusyBox estático,
+  toolchain, headers e utilitários de sessão são validados antes do uso.
 - Os links de applets BusyBox necessários ao sistema são comparados com
   `busybox --list` antes de o initramfs ser empacotado. O próprio
   `/bin/busybox`, porém, é um multiplexer e também permite chamar outros applets
@@ -55,27 +59,70 @@ SSH do aluno
 logout / queda do SSH / timeout → trap → mata grupo do QEMU → remove runtime
 ```
 
-## 1. Preparar a VM Debian 12
+## 0. Transferir o projeto sem perder arquivos ocultos
+
+O marcador `.kernel-ctf-project` identifica a raiz antes de qualquer build ou
+limpeza. Não copie a origem com `KernelVuln/*`: esse padrão omite o marcador e o
+`.gitignore`.
+
+Na origem completa, gere o pacote-fonte de transferência da infraestrutura,
+sem a flag, sem artefatos gerados e sem o gabarito reservado:
+
+```sh
+bash scripts/package-source.sh
+```
+
+Transfira `kernel-ctf-source.tar.xz` e o respectivo `.sha256`, confira o digest
+na VM e extraia o arquivo em um diretório vazio. O pacote usa uma lista explícita
+em `config/source-files.list`, portanto inclui os dotfiles necessários e exclui
+`config/flag.txt`, `build/`, `dist/`, `downloads/` e metadados locais.
+O gabarito `docs/INSTRUCTOR-SOLUTIONS.md` é deliberadamente ignorado pelo Git e
+rejeitado pelo empacotador. Ainda assim, o pacote-fonte **não é um pacote de
+aluno**; o único arquivo entregue aos jogadores é o `player-handout` descrito
+abaixo.
+
+Se uma cópia já chegou à VM sem os dotfiles, ela está incompleta: não restaure
+apenas o marcador, pois o `.gitignore` também protege a flag e os artefatos
+privados. Extraia novamente o pacote-fonte íntegro em um diretório vazio.
+
+## 1. Preparar a VM Linux x86_64
 
 Crie uma **VM**, não um LXC, no Proxmox. Recomenda-se 4 vCPU, 4–8 GiB de RAM e
 40 GiB de disco durante a compilação. Use CPU type `host` se quiser KVM aninhado;
 sem `/dev/kvm`, o launcher usa TCG automaticamente. Veja
 [docs/PROXMOX.md](docs/PROXMOX.md).
 
-Dentro do Debian 12:
+Os perfis, as limitações conhecidas e os comandos sugeridos para cada família
+estão em [docs/PLATFORMS.md](docs/PLATFORMS.md). Por exemplo, na baseline Debian
+12:
 
 ```sh
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
   build-essential binutils bc bison flex cpio gzip xz-utils wget ca-certificates \
   busybox-static libelf-dev libssl-dev openssl dwarves pkg-config perl python3 \
-  qemu-system-x86 util-linux coreutils openssh-server systemd passwd
+  qemu-system-x86 util-linux coreutils findutils grep sed gawk tar diffutils \
+  openssh-server systemd passwd
 
 bash scripts/check-deps.sh all
 ```
 
+Em Fedora/RHEL-like, Arch-like, openSUSE/SLES ou outra distribuição, use o
+comando correspondente do guia de plataformas e sempre termine com
+`bash scripts/check-deps.sh all`. O script verifica executáveis e recursos
+reais, inclusive que o BusyBox é estático e que o QEMU oferece as opções de
+isolamento exigidas. Em variantes RHEL, BusyBox e dependências estáticas podem
+exigir repositórios complementares; em SUSE, a disponibilidade de
+`busybox-static` varia por versão.
+
 Execute configuração, build e testes como usuário comum; esses scripts recusam
 UID 0. Somente `install-host.sh` deve ser chamado com `sudo`.
+
+Compatibilidade por capacidades não equivale a certificação E2E de toda versão
+de cada distribuição. Debian 12 + QEMU é a baseline de validação; antes de
+publicar a turma, confirme no host Linux de destino o build, os boots dos níveis
+0–4 e o launcher. Validação estática feita em outra plataforma não substitui
+esse ensaio.
 
 ## 2. Definir flag e nível
 
@@ -110,9 +157,9 @@ bash configure.sh --level 0 --flag-file /caminho/seguro/flag.txt
 “Nível 0” significa **sem as quatro mitigações graduadas** da tabela, não um
 kernel sem qualquer proteção. `CONFIG_STACKPROTECTOR_STRONG` permanece ativo
 globalmente e é desabilitado somente no módulo didático. `CONFIG_FORTIFY_SOURCE`
-e `CONFIG_HARDENED_USERCOPY` também permanecem ativos no restante do kernel; o
-autoteste confirma que o contrato didático do módulo continua disponível com
-essas proteções globais habilitadas.
+e `CONFIG_HARDENED_USERCOPY` permanecem ativos globalmente; o autoteste confirma
+uma leitura de 128 bytes e uma escrita de 65 bytes sobre o array de 64 bytes,
+provando que o contrato didático mínimo continua disponível com essas proteções.
 O `kernel.config` entregue aos jogadores é a referência exata da configuração.
 
 Outros limites ficam em [config/lab.conf](config/lab.conf), num formato
@@ -132,11 +179,13 @@ bash tests/integration.sh
 bash tests/launcher.sh
 ```
 
-O teste de integração inicia QEMU com `lab.selftest=1` em **todos os níveis de 0
-a 4**. Em cada boot o próprio guest confere as flags SMEP/SMAP da CPU virtual,
+Quando executado em um host Linux preparado, o teste de integração inicia QEMU
+com `lab.selftest=1` em **todos os níveis de 0 a 4**. Em cada boot o próprio
+guest confere as flags SMEP/SMAP da CPU virtual,
 os parâmetros KASLR/KPTI, os três sysctls da tabela, UID/GID 1000, grupos
 suplementares vazios, flag inacessível e poweroff. O build pode levar vários
-minutos e ocupar alguns GiB.
+minutos e ocupar alguns GiB. Esses boots também exigem os marcadores
+`KVULN_OVERSIZED_READ=PASS` e `KVULN_OVERSIZED_WRITE=PASS`.
 
 `tests/launcher.sh` executa ainda o launcher de produção em modo de autoteste no
 nível padrão. Isso cobre a validação do manifesto, a seleção de aceleração, o
@@ -187,7 +236,9 @@ O instalador:
 4. instala chaves root-owned em `/etc/ssh/authorized_keys/kernelctf`;
 5. acrescenta um bloco `Match User` gerenciado no fim de `sshd_config`;
 6. valida a sintaxe com `sshd -t` e a política efetiva com `sshd -T -C`, usando
-   o contexto configurado, antes de trocar o arquivo e recarregar `ssh.service`.
+   o contexto configurado, antes de trocar o arquivo e recarregar a unidade
+   OpenSSH detectada (`ssh.service`/`sshd.service`) ou preparar a próxima
+   ativação por `ssh.socket`/`sshd.socket`.
 
 Teste a partir de outra conexão, mantendo a sessão administrativa aberta:
 
@@ -210,8 +261,8 @@ do administrador.
 
 Faça a troca em uma janela de manutenção. Primeiro feche a porta/rede dos
 alunos para novas conexões, aguarde as sessões QEMU existentes terminarem
-(`drain`) e confirme que não há instâncias ativas. Atualize Debian, QEMU e
-OpenSSH no host dedicado, reinicie o host se necessário e só então troque
+(`drain`) e confirme que não há instâncias ativas. Atualize a distribuição,
+QEMU e OpenSSH no host dedicado, reinicie o host se necessário e só então troque
 flag/nível, reconstrua e reinstale os artefatos:
 
 ```sh
@@ -250,11 +301,17 @@ antes de o arquivo receber permissão de execução. O arquivo ficará em
 - `challenge/`: módulo vulnerável de exemplo.
 - `rootfs/`: PID 1, helper de identidade, passwd/group e utilitários do aluno.
 - `scripts/check-deps.sh`: auditoria de dependências por perfil.
+- `scripts/package-source.sh`: pacote-fonte seguro que preserva os dotfiles.
 - `build.sh`: kernel, módulo, initramfs, manifesto SHA-256 e handout público.
 - `reset.sh`: remove somente `build/` e `dist/` e reconstrói do zero.
 - `bin/kernel-ctf-session`: lifecycle e isolamento QEMU.
-- `install-host.sh`: conta, arquivos, tmpfiles e `sshd` no Debian 12.
+- `install-host.sh`: conta, arquivos, tmpfiles e `sshd` no host com systemd.
 - `tests/`: revisão estática e boot real automatizado.
 
 O modelo de ameaça e os limites da expressão “isolado” estão documentados em
 [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
+
+Instrutores também podem receber, por um canal privado separado, o roteiro
+técnico reservado `docs/INSTRUCTOR-SOLUTIONS.md`. Ele contém as soluções dos
+desafios e é ignorado pelo Git: **nunca o inclua no handout, em material público
+ou em uma cópia entregue aos alunos**.

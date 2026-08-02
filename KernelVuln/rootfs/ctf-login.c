@@ -142,8 +142,9 @@ static void prepare_environment(void)
 static void validate_training_device(void)
 {
     unsigned char leak_buffer[128];
+    unsigned char write_probe[65];
     static const unsigned char expected_prefix[] = KVULN_EXPECTED_PREFIX;
-    ssize_t bytes_read;
+    ssize_t bytes_read, bytes_written;
     int device_fd;
 
     device_fd = open(VULN_DEVICE_PATH, O_RDWR | O_CLOEXEC);
@@ -152,7 +153,6 @@ static void validate_training_device(void)
               VULN_DEVICE_PATH, strerror(errno));
 
     bytes_read = read(device_fd, leak_buffer, sizeof(leak_buffer));
-    close(device_fd);
     if (bytes_read != (ssize_t)sizeof(leak_buffer))
         fatal("interface de leitura divergente: esperado=%zu obtido=%zd",
               sizeof(leak_buffer), bytes_read);
@@ -160,7 +160,15 @@ static void validate_training_device(void)
     if (memcmp(leak_buffer, expected_prefix, sizeof(expected_prefix) - 1) != 0)
         fatal("prefixo inesperado na resposta de %s", VULN_DEVICE_PATH);
 
+    memset(write_probe, 'A', sizeof(write_probe));
+    bytes_written = write(device_fd, write_probe, sizeof(write_probe));
+    close(device_fd);
+    if (bytes_written != (ssize_t)sizeof(write_probe))
+        fatal("interface de escrita divergente: esperado=%zu obtido=%zd",
+              sizeof(write_probe), bytes_written);
+
     puts("SELFTEST: KVULN_OVERSIZED_READ=PASS");
+    puts("SELFTEST: KVULN_OVERSIZED_WRITE=PASS");
 }
 
 int main(int argc, char **argv)

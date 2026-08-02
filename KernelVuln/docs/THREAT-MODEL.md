@@ -6,8 +6,8 @@ O aluno controla totalmente o guest: pode explorar o módulo, obter UID 0 no
 kernel vulnerável, causar panic e modificar o initramfs já expandido em RAM. Isso
 é o objetivo do exercício. As fronteiras que devem sobreviver são:
 
-1. o processo QEMU sem privilégios no Debian;
-2. a VM Debian 12 dedicada no Proxmox;
+1. o processo QEMU sem privilégios no host Linux;
+2. a VM Linux x86_64 dedicada no Proxmox;
 3. o nó Proxmox e o restante da infraestrutura.
 
 Não existe isolamento “matematicamente completo” para código hostil. Bugs de
@@ -54,10 +54,17 @@ controles de identidade e permissões.
 
 ## Controles do host SSH
 
+O build e o runtime são aceitos em Linux x86_64 por capacidades. A publicação
+do endpoint SSH tem uma fronteira adicional: exige `systemd` ativo como PID 1 e
+OpenSSH, independentemente da família da distribuição. Os perfis de pacotes não
+são controles de segurança; é `scripts/check-deps.sh` que valida as capacidades
+efetivamente instaladas.
+
 - conta de sistema com senha bloqueada e home root-owned;
 - chaves root-owned e artefatos `root:kernelctf`, não legíveis por outros
   usuários locais;
-- `ForceCommand` sob `/usr/bin/env -i`;
+- `ForceCommand` sob um `env -i` resolvido em caminho absoluto e administrado
+  por root;
 - `PermitUserEnvironment` e `SetEnv` recusados, com `AcceptEnv` limitado a
   `LANG`/`LC_*` (`TERM` continua sendo a exceção exigida pelo protocolo) antes
   de o ambiente ser limpo;
@@ -75,9 +82,11 @@ controles de identidade e permissões.
   consegue extrair o initramfs;
 - vazamento da flag pela distribuição acidental de `dist/` ou do
   `initramfs.cpio.gz`; somente `player-handout.tar.xz` é público;
+- vazamento das soluções pela publicação acidental do guia reservado
+  `docs/INSTRUCTOR-SOLUTIONS.md`;
 - erro de firewall/Proxmox fora do escopo dos scripts;
 - compartilhamento de uma chave SSH entre alunos, se o instrutor optar por isso.
 
-Mitigue mantendo o Debian dedicado, atualizado antes de congelar a turma,
+Mitigue mantendo o host Linux dedicado, atualizado antes de congelar a turma,
 separando redes, usando chaves individuais e restaurando o snapshot externo ao
 fim da atividade.

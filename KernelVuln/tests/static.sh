@@ -5,6 +5,7 @@ PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=scripts/lib.sh
 source "$PROJECT_ROOT/scripts/lib.sh"
 assert_project_root "$PROJECT_ROOT"
+bash "$PROJECT_ROOT/scripts/package-source.sh" --check
 
 failures=0
 
@@ -106,6 +107,8 @@ check_contains "$PROJECT_ROOT/rootfs/ctf-login.c" 'errno != EACCES' \
     "ctf-login nao verifica negacao de leitura da flag"
 check_contains "$PROJECT_ROOT/rootfs/ctf-login.c" 'SELFTEST: KVULN_OVERSIZED_READ=PASS' \
     "autoteste nao publica o marcador da leitura oversized"
+check_contains "$PROJECT_ROOT/rootfs/ctf-login.c" 'SELFTEST: KVULN_OVERSIZED_WRITE=PASS' \
+    "autoteste nao publica o marcador da escrita oversized"
 check_contains "$PROJECT_ROOT/challenge/kvuln.c" 'copy_to_user[[:space:]]*\(' \
     "leitura didatica nao usa copy_to_user"
 check_contains "$PROJECT_ROOT/challenge/kvuln.c" 'copy_from_user[[:space:]]*\(' \
@@ -116,7 +119,8 @@ check_contains "$PROJECT_ROOT/challenge/kvuln.c" 'kvuln_hide_pointer' \
     "modulo nao oculta object_size para preservar o bug intencional"
 
 for protection in CONFIG_X86_SMEP CONFIG_X86_SMAP CONFIG_UNWINDER_ORC CONFIG_STACKPROTECTOR \
-    CONFIG_STACKPROTECTOR_STRONG CONFIG_FORTIFY_SOURCE CONFIG_HARDENED_USERCOPY; do
+    CONFIG_STACKPROTECTOR_STRONG CONFIG_FORTIFY_SOURCE CONFIG_HARDENED_USERCOPY \
+    CONFIG_HARDENED_USERCOPY_DEFAULT_ON; do
     check_contains "$PROJECT_ROOT/build.sh" \
         "(^|[[:space:]])(-e|--enable)[[:space:]]+$protection([[:space:]]|$)" \
         "protecao global do kernel nao esta habilitada: $protection"
@@ -211,8 +215,21 @@ for required_applet in base64 insmod mktemp poweroff sha256sum; do
         "(^|[[:space:]])$required_applet([[:space:]]|\\))" \
         "applet BusyBox obrigatorio nao aparece na lista validada: $required_applet"
 done
-check_contains "$PROJECT_ROOT/scripts/check-deps.sh" 'qemu-system-x86_64.*cpio' \
-    "checagem de qemu-system-x86_64/cpio ausente"
+check_contains "$PROJECT_ROOT/scripts/lib.sh" 'qemu-system-x86_64 qemu-kvm' \
+    "resolver portavel de QEMU x86_64 ausente"
+check_contains "$PROJECT_ROOT/scripts/lib.sh" 'Bash 4\.4 ou superior' \
+    "baseline portavel de Bash 4.4 ausente"
+check_contains "$PROJECT_ROOT/bin/kernel-ctf-session" '"\$QEMU_X86_64_BIN"' \
+    "launcher nao usa o QEMU resolvido por capacidade"
+for portable_entrypoint in build.sh reset.sh run-local.sh install-host.sh \
+    tests/initramfs.sh tests/integration.sh tests/launcher.sh; do
+    check_absent "$PROJECT_ROOT/$portable_entrypoint" 'require_debian_bookworm' \
+        "entrypoint legado de Debian ainda esta referenciado: $portable_entrypoint"
+done
+check_contains "$PROJECT_ROOT/.kernel-ctf-project" '^kernel-ctf-lab-v1$' \
+    "marcador canonico de plataforma ausente"
+check_contains "$PROJECT_ROOT/Makefile" '^platform-test:' \
+    "target de teste dos perfis de plataforma ausente"
 check_contains "$PROJECT_ROOT/install-host.sh" \
     'INSTALL_ROOT =~ \^/opt' \
     "install-host nao restringe o destino a /opt"
@@ -228,15 +245,41 @@ for ssh_guard in 'permituserenvironment no' 'strictmodes yes' \
         "install-host nao exige a protecao SSH efetiva: $ssh_guard"
 done
 check_contains "$PROJECT_ROOT/install-host.sh" \
-    "'acceptenv LANG'\|'acceptenv LC_\*'" \
+    'LANG\|LC_\*' \
     "install-host nao limita AcceptEnv às variaveis de locale esperadas"
+check_contains "$PROJECT_ROOT/install-host.sh" '^[[:space:]]+AcceptEnv LANG$' \
+    "bloco SSH gerenciado nao fixa AcceptEnv LANG"
+check_contains "$PROJECT_ROOT/install-host.sh" '^[[:space:]]+AcceptEnv LC_\*$' \
+    "bloco SSH gerenciado nao fixa AcceptEnv LC_*"
 check_contains "$PROJECT_ROOT/install-host.sh" "grep -q '\^setenv '" \
     "install-host nao rejeita SetEnv na politica SSH efetiva"
 check_contains "$PROJECT_ROOT/install-host.sh" 'rollback_ssh_on_exit' \
     "install-host nao possui rollback SSH para falhas inesperadas"
+check_contains "$PROJECT_ROOT/install-host.sh" 'resolve_sshd_unit' \
+    "install-host nao resolve a unidade OpenSSH por capacidade"
+check_contains "$PROJECT_ROOT/install-host.sh" 'ssh\.socket.*sshd\.socket' \
+    "install-host nao contempla ativacao OpenSSH por socket"
+check_contains "$PROJECT_ROOT/install-host.sh" 'cp --preserve=all' \
+    "install-host nao preserva ACLs/xattrs nos backups SSH"
+check_contains "$PROJECT_ROOT/install-host.sh" 'restorecon -RF' \
+    "install-host nao restaura contextos do diretorio publicado"
+check_contains "$PROJECT_ROOT/install-host.sh" 'noexec' \
+    "install-host nao rejeita /opt montado com noexec"
+check_absent "$PROJECT_ROOT/install-host.sh" 'systemctl reload ssh\.service' \
+    "install-host ainda recarrega a unidade Debian de forma fixa"
+check_absent "$PROJECT_ROOT/install-host.sh" 'install -d.* /run/sshd' \
+    "install-host ainda cria o diretorio de privilege separation do Debian"
 check_contains "$PROJECT_ROOT/install-host.sh" \
     'novas chaves autorizadas publicadas após a validação do SSH' \
     "install-host publica authorized_keys antes de validar e recarregar o SSH"
+check_absent "$PROJECT_ROOT/config/source-files.list" '^docs/INSTRUCTOR-SOLUTIONS\.md$' \
+    "pacote-fonte publico inclui o gabarito reservado dos instrutores"
+check_contains "$PROJECT_ROOT/.gitignore" '^docs/INSTRUCTOR-SOLUTIONS\.md$' \
+    "gitignore nao protege o gabarito reservado dos instrutores"
+check_contains "$PROJECT_ROOT/.gitattributes" '^\* text=auto eol=lf$' \
+    "gitattributes nao preserva LF nos arquivos de texto"
+check_contains "$PROJECT_ROOT/README.md" 'único pacote que deve ser entregue aos jogadores' \
+    "README nao restringe a entrega dos jogadores ao handout publico"
 
 for public_directory in '' bin sbin etc lib; do
     if [[ -n $public_directory ]]; then

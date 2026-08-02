@@ -21,6 +21,8 @@ esac
 
 require_non_root
 bash "$LAB_ROOT/scripts/check-deps.sh" runtime
+QEMU_X86_64_BIN=$(resolve_qemu_x86_64) || \
+    die "QEMU x86_64 não encontrado após a validação"
 
 DIST_DIR=$LAB_ROOT/dist
 RUNTIME_CONFIG=$DIST_DIR/runtime.conf
@@ -126,8 +128,11 @@ ulimit -n 128
 ulimit -v "$HOST_VMEM_KIB"
 
 export HOME=/nonexistent
-export USER=kernelctf
-export LOGNAME=kernelctf
+SESSION_USER=$(id -un)
+[[ $SESSION_USER =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || \
+    die "nome da conta de sessão inválido: $SESSION_USER"
+export USER=$SESSION_USER
+export LOGNAME=$SESSION_USER
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LANG=C
 export LC_ALL=C
@@ -146,7 +151,7 @@ printf '[*] A VM é nova, sem rede e será destruída ao sair.\n\n'
 
 setsid timeout --foreground --signal=TERM --kill-after=5s \
     "${SESSION_TIMEOUT_SECONDS}s" \
-    qemu-system-x86_64 \
+    "$QEMU_X86_64_BIN" \
         -name "kernel-ctf-$slot,process=kernel-ctf" \
         -machine pc \
         -accel "$ACCELERATOR" \

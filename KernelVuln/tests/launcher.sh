@@ -6,7 +6,7 @@ PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=scripts/lib.sh
 source "$PROJECT_ROOT/scripts/lib.sh"
 assert_project_root "$PROJECT_ROOT"
-require_debian_bookworm
+require_linux_x86_64
 require_non_root
 bash "$PROJECT_ROOT/scripts/check-deps.sh" runtime
 
@@ -55,6 +55,7 @@ fi
 
 if ! grep -Fq 'SELFTEST: PASS' "$log_file" ||
    ! grep -Fq 'SELFTEST: KVULN_OVERSIZED_READ=PASS' "$log_file" ||
+   ! grep -Fq 'SELFTEST: KVULN_OVERSIZED_WRITE=PASS' "$log_file" ||
    ! grep -Fq "SELFTEST: LEVEL_POLICY_$level=PASS" "$log_file" ||
    ! grep -Fq 'acesso à flag=negado' "$log_file" ||
    ! grep -Fq 'autoteste do launcher encerrado; estado descartado' "$log_file"; then

@@ -7,7 +7,7 @@ source "$PROJECT_ROOT/scripts/lib.sh"
 
 assert_project_root "$PROJECT_ROOT"
 require_non_root
-require_debian_bookworm
+require_linux_x86_64
 
 PURGE_DOWNLOADS=0
 case "${1-}" in

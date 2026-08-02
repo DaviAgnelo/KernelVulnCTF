@@ -7,6 +7,8 @@ source "$PROJECT_ROOT/scripts/lib.sh"
 
 assert_project_root "$PROJECT_ROOT"
 require_non_root
+require_linux_x86_64
+bash "$PROJECT_ROOT/scripts/check-deps.sh" runtime
 LOCAL_RUNTIME=$PROJECT_ROOT/build/local-runtime
 mkdir -p "$LOCAL_RUNTIME"
 chmod 0700 "$LOCAL_RUNTIME"

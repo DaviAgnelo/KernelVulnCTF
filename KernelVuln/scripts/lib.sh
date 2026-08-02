@@ -23,6 +23,19 @@ die()
     exit 1
 }
 
+require_bash_44()
+{
+    if ((BASH_VERSINFO[0] < 4 ||
+         (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+        die "Bash 4.4 ou superior é obrigatório (detectado: $BASH_VERSION)"
+    fi
+}
+
+# Bash 4.4 é o menor denominador comum dos perfis suportados e já oferece os
+# recursos usados aqui (arrays associativos, mapfile e read -d). Falhar ao
+# carregar a biblioteca é mais seguro do que prosseguir com outra semântica.
+require_bash_44
+
 require_root()
 {
     [[ $(id -u) -eq 0 ]] || die "execute este script como root (use sudo)"
@@ -87,31 +100,190 @@ require_uint_range()
         die "$label deve estar entre $minimum e $maximum"
 }
 
-require_debian_bookworm()
+PLATFORM_DETECTED=0
+PLATFORM_KERNEL=''
+PLATFORM_MACHINE=''
+PLATFORM_ARCH=''
+PLATFORM_ID='unknown'
+PLATFORM_ID_LIKE=''
+PLATFORM_VERSION_ID=''
+PLATFORM_FAMILY='generic'
+PLATFORM_PACKAGE_MANAGER=''
+
+platform_has_token()
 {
-    local os_id='' codename='' key value
+    local expected=$1 candidate
+    local -a platform_tokens=()
 
-    [[ -r /etc/os-release ]] || die "/etc/os-release não existe; Debian 12 é obrigatório"
-    while IFS='=' read -r key value; do
-        value=${value#\"}
-        value=${value%\"}
-        case "$key" in
-            ID) os_id=$value ;;
-            VERSION_CODENAME) codename=$value ;;
-        esac
-    done < /etc/os-release
+    read -r -a platform_tokens <<<"$PLATFORM_ID $PLATFORM_ID_LIKE"
+    for candidate in "${platform_tokens[@]}"; do
+        [[ $candidate == "$expected" ]] && return 0
+    done
+    return 1
+}
 
-    [[ $os_id == debian && $codename == bookworm ]] || \
-        die "host não suportado: esperado Debian 12 Bookworm; detectado ID=$os_id CODENAME=$codename"
+classify_linux_platform()
+{
+    local package_manager
+
+    PLATFORM_FAMILY=generic
+    PLATFORM_PACKAGE_MANAGER=''
+    if platform_has_token debian || platform_has_token ubuntu ||
+       platform_has_token linuxmint || platform_has_token pop ||
+       platform_has_token kali || platform_has_token raspbian; then
+        PLATFORM_FAMILY=debian
+        PLATFORM_PACKAGE_MANAGER=apt-get
+    elif platform_has_token fedora || platform_has_token rhel ||
+         platform_has_token centos || platform_has_token rocky ||
+         platform_has_token almalinux || platform_has_token ol ||
+         platform_has_token amzn; then
+        PLATFORM_FAMILY=fedora-rhel
+        if command -v dnf >/dev/null 2>&1; then
+            PLATFORM_PACKAGE_MANAGER=dnf
+        elif command -v yum >/dev/null 2>&1; then
+            PLATFORM_PACKAGE_MANAGER=yum
+        else
+            PLATFORM_PACKAGE_MANAGER=dnf
+        fi
+    elif platform_has_token arch || platform_has_token manjaro ||
+         platform_has_token endeavouros; then
+        PLATFORM_FAMILY=arch
+        PLATFORM_PACKAGE_MANAGER=pacman
+    elif platform_has_token suse || platform_has_token opensuse ||
+         platform_has_token sles || platform_has_token sled ||
+         platform_has_token opensuse-leap ||
+         platform_has_token opensuse-tumbleweed; then
+        PLATFORM_FAMILY=suse
+        PLATFORM_PACKAGE_MANAGER=zypper
+    else
+        for package_manager in apt-get dnf yum pacman zypper; do
+            if command -v "$package_manager" >/dev/null 2>&1; then
+                PLATFORM_PACKAGE_MANAGER=$package_manager
+                break
+            fi
+        done
+    fi
+}
+
+detect_linux_platform()
+{
+    local line key value first_character last_character os_release_file=''
+
+    ((PLATFORM_DETECTED == 0)) || return 0
+    command -v uname >/dev/null 2>&1 || die "dependência básica ausente: uname"
+
+    PLATFORM_KERNEL=$(uname -s) || die "não foi possível detectar o sistema operacional"
+    PLATFORM_MACHINE=$(uname -m) || die "não foi possível detectar a arquitetura"
+    case "$PLATFORM_MACHINE" in
+        x86_64|amd64) PLATFORM_ARCH=x86_64 ;;
+        *) PLATFORM_ARCH=$PLATFORM_MACHINE ;;
+    esac
+
+    if [[ -r /etc/os-release ]]; then
+        os_release_file=/etc/os-release
+    elif [[ -r /usr/lib/os-release ]]; then
+        os_release_file=/usr/lib/os-release
+    fi
+    if [[ -n $os_release_file ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            line=${line%$'\r'}
+            [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
+            key=${BASH_REMATCH[1]}
+            value=${BASH_REMATCH[2]}
+            if ((${#value} >= 2)); then
+                first_character=${value:0:1}
+                last_character=${value: -1}
+                if [[ ($first_character == '"' && $last_character == '"') ||
+                      ($first_character == "'" && $last_character == "'") ]]; then
+                    value=${value:1:${#value}-2}
+                fi
+            fi
+
+            case "$key" in
+                ID)
+                    value=${value,,}
+                    [[ $value =~ ^[a-z0-9._-]+$ ]] && PLATFORM_ID=$value
+                    ;;
+                ID_LIKE)
+                    value=${value,,}
+                    value=${value//$'\t'/ }
+                    [[ $value =~ ^[a-z0-9._[:space:]-]*$ ]] && PLATFORM_ID_LIKE=$value
+                    ;;
+                VERSION_ID)
+                    [[ $value =~ ^[A-Za-z0-9._+-]+$ ]] && PLATFORM_VERSION_ID=$value
+                    ;;
+            esac
+        done < "$os_release_file"
+    fi
+
+    classify_linux_platform
+    PLATFORM_DETECTED=1
+}
+
+require_linux_x86_64()
+{
+    require_bash_44
+    detect_linux_platform
+    [[ $PLATFORM_KERNEL == Linux ]] || \
+        die "host não suportado: Linux x86_64 é obrigatório (detectado: $PLATFORM_KERNEL/$PLATFORM_MACHINE)"
+    [[ $PLATFORM_ARCH == x86_64 ]] || \
+        die "arquitetura não suportada: x86_64 é obrigatória (detectado: $PLATFORM_MACHINE)"
+}
+
+resolve_qemu_x86_64()
+{
+    local candidate resolved
+    local -a qemu_candidates=()
+
+    for candidate in qemu-system-x86_64 qemu-kvm; do
+        resolved=$(type -P "$candidate" 2>/dev/null || true)
+        [[ -n $resolved ]] && qemu_candidates+=("$resolved")
+    done
+    qemu_candidates+=(/usr/bin/qemu-system-x86_64 /usr/bin/qemu-kvm
+        /usr/libexec/qemu-kvm)
+
+    for candidate in "${qemu_candidates[@]}"; do
+        [[ -f $candidate && -x $candidate ]] || continue
+        resolved=$(readlink -f -- "$candidate" 2>/dev/null) || continue
+        [[ -n $resolved && -f $resolved && -x $resolved ]] || continue
+        printf '%s\n' "$resolved"
+        return 0
+    done
+    return 1
+}
+
+require_systemd_host()
+{
+    local pid1_comm=''
+
+    require_linux_x86_64
+    command -v systemctl >/dev/null 2>&1 || \
+        die "a instalação do host exige systemctl"
+    command -v systemd-tmpfiles >/dev/null 2>&1 || \
+        die "a instalação do host exige systemd-tmpfiles"
+    if [[ -r /proc/1/comm ]]; then
+        IFS= read -r pid1_comm < /proc/1/comm || \
+            die "não foi possível identificar o PID 1"
+    fi
+    [[ $pid1_comm == systemd && -d /run/systemd/system ]] || \
+        die "a instalação do host exige systemd ativo como PID 1; build e runtime não possuem essa exigência"
 }
 
 assert_project_root()
 {
-    local project_root=$1
-    [[ -f $project_root/.kernel-ctf-project ]] || \
-        die "marcador .kernel-ctf-project ausente em $project_root"
-    [[ $(<"$project_root/.kernel-ctf-project") == kernel-ctf-lab-debian12 ]] || \
-        die "marcador de projeto inválido em $project_root"
+    local project_root=$1 marker_value
+    [[ -f $project_root/.kernel-ctf-project &&
+       ! -L $project_root/.kernel-ctf-project &&
+       -r $project_root/.kernel-ctf-project ]] || \
+        die "marcador .kernel-ctf-project ausente ou inseguro em $project_root; a cópia provavelmente omitiu arquivos ocultos (não transfira KernelVuln/*)"
+    marker_value=$(<"$project_root/.kernel-ctf-project")
+    case "$marker_value" in
+        kernel-ctf-lab-v1) ;;
+        kernel-ctf-lab-debian12)
+            log_warn "marcador legado detectado; migre .kernel-ctf-project para kernel-ctf-lab-v1"
+            ;;
+        *) die "marcador de projeto inválido em $project_root" ;;
+    esac
 }
 
 validate_lab_values()

@@ -43,7 +43,7 @@ mapfile -t flag_lines < "$FLAG_FILE"
 busybox_program_headers=$(readelf -l "$BUSYBOX_PATH") || \
     die "não foi possível inspecionar o BusyBox com readelf"
 if grep -q 'INTERP' <<<"$busybox_program_headers"; then
-    die "$BUSYBOX_PATH não é estático; instale busybox-static no Debian 12"
+    die "$BUSYBOX_PATH não é estático; instale ou forneça um BusyBox estaticamente ligado"
 fi
 
 declare -a applets=(ash base64 cat chmod chown cp dd dmesg echo false grep head \

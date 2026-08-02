@@ -1,0 +1,30 @@
+# Segredos e artefatos gerados
+config/flag.txt
+config/.flag-input.*
+config/flag.txt.*
+!config/flag.txt.example
+config/lab.conf.*
+downloads/
+build/
+dist/
+kernel-ctf-source.tar.xz
+kernel-ctf-source.tar.xz.sha256
+.kernel-ctf-source.*
+
+# Material reservado da equipe docente (distribuído por canal privado)
+docs/INSTRUCTOR-SOLUTIONS.md
+
+# Artefatos do módulo, caso alguém o compile no diretório-fonte
+challenge/*.ko
+challenge/*.o
+challenge/*.mod
+challenge/*.mod.c
+challenge/*.order
+challenge/*.symvers
+challenge/.*.cmd
+
+# Editores
+*~
+*.swp
+.idea/
+.vscode/

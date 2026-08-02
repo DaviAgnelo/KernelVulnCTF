@@ -6,9 +6,10 @@ PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=scripts/lib.sh
 source "$PROJECT_ROOT/scripts/lib.sh"
 assert_project_root "$PROJECT_ROOT"
-require_debian_bookworm
+require_linux_x86_64
 require_non_root
 bash "$PROJECT_ROOT/scripts/check-deps.sh" runtime
+QEMU_X86_64_BIN=$(resolve_qemu_x86_64) || die "QEMU x86_64 não encontrado após a validação"
 
 for artifact in bzImage initramfs.cpio.gz runtime.conf SHA256SUMS; do
     [[ -r $PROJECT_ROOT/dist/$artifact ]] || die "artefato ausente: dist/$artifact"
@@ -53,7 +54,7 @@ run_level()
     log_info "autoteste real do nivel $level (CPU=$cpu_model; mitigacoes=$mitigation_args)"
     set +e
     timeout --signal=TERM --kill-after=5s 60s \
-        qemu-system-x86_64 \
+        "$QEMU_X86_64_BIN" \
             -machine pc \
             -accel tcg,thread=multi \
             -cpu "$cpu_model" \
@@ -84,6 +85,7 @@ run_level()
 
     if ! grep -Fq 'SELFTEST: PASS' "$log_file" ||
        ! grep -Fq 'SELFTEST: KVULN_OVERSIZED_READ=PASS' "$log_file" ||
+       ! grep -Fq 'SELFTEST: KVULN_OVERSIZED_WRITE=PASS' "$log_file" ||
        ! grep -Fq "SELFTEST: LEVEL_POLICY_$level=PASS" "$log_file" ||
        ! grep -Fq 'acesso à flag=negado' "$log_file"; then
         [[ -f $log_file ]] && cat "$log_file" >&2

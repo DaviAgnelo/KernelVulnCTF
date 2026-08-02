@@ -6,7 +6,7 @@ PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=scripts/lib.sh
 source "$PROJECT_ROOT/scripts/lib.sh"
 assert_project_root "$PROJECT_ROOT"
-require_debian_bookworm
+require_linux_x86_64
 require_non_root
 
 for required_command in cpio gzip sha256sum stat tar; do
@@ -140,6 +140,9 @@ if [[ -e $handout ]]; then
     tar -tf "$handout" > "$handout_listing" || die "handout nao e um tar.xz valido"
     if grep -Eiq '(^|/)[^/]*(initramfs|flag)[^/]*($|/)' "$handout_listing"; then
         die "handout contem initramfs ou arquivo de flag"
+    fi
+    if grep -Eiq '(^|/)[^/]*(solution|solucao|instructor)[^/]*($|/)' "$handout_listing"; then
+        die "handout contem material reservado de instrutor ou solucao"
     fi
 
     # Se a flag local ainda estiver disponivel, garante tambem que seu valor nao

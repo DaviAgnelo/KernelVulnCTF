@@ -8,7 +8,7 @@ source "$PROJECT_ROOT/scripts/lib.sh"
 
 assert_project_root "$PROJECT_ROOT"
 require_non_root
-require_debian_bookworm
+require_linux_x86_64
 load_lab_config "$PROJECT_ROOT/config/lab.conf"
 validate_lab_values
 
@@ -109,7 +109,8 @@ build_kernel()
         -e CONFIG_STACKPROTECTOR \
         -e CONFIG_STACKPROTECTOR_STRONG \
         -e CONFIG_FORTIFY_SOURCE \
-        -e CONFIG_HARDENED_USERCOPY
+        -e CONFIG_HARDENED_USERCOPY \
+        -e CONFIG_HARDENED_USERCOPY_DEFAULT_ON
 
     make -C "$KERNEL_SOURCE" O="$KERNEL_OUTPUT" ARCH=x86_64 olddefconfig
     for required_config in CONFIG_64BIT CONFIG_BLK_DEV_INITRD CONFIG_RD_GZIP \
@@ -119,7 +120,7 @@ build_kernel()
         CONFIG_PERF_EVENTS CONFIG_RANDOMIZE_BASE CONFIG_PAGE_TABLE_ISOLATION \
         CONFIG_X86_SMEP CONFIG_X86_SMAP CONFIG_UNWINDER_ORC CONFIG_STACKPROTECTOR \
         CONFIG_STACKPROTECTOR_STRONG CONFIG_FORTIFY_SOURCE \
-        CONFIG_HARDENED_USERCOPY; do
+        CONFIG_HARDENED_USERCOPY CONFIG_HARDENED_USERCOPY_DEFAULT_ON; do
         grep -Fqx "$required_config=y" "$KERNEL_OUTPUT/.config" || \
             die "olddefconfig não preservou a opção obrigatória: $required_config=y"
     done
